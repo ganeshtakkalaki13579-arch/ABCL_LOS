@@ -718,6 +718,7 @@ table.tbl tr{cursor:pointer}
         <label class="checkrow"><input type="checkbox" id="liRemember" checked> Remember my login ID &amp; password on this PC</label>
         <button class="btn-primary" type="submit">Log In →</button>
         <div class="auth-alt">New to the site? <a onclick="AUTH.tab('signup')">Sign up</a> &nbsp;·&nbsp; <a onclick="AUTH.tab('reset')">Forgot password?</a></div>
+        <div class="auth-alt" style="margin-top:8px"><a onclick="CLOUD.openSetup()">☁️ Cloud sync (use your account on any device)</a></div>
       </form>
 
       <!-- SIGNUP -->
@@ -819,6 +820,7 @@ table.tbl tr{cursor:pointer}
         <div class="mh" id="menuEmail">user@email</div>
         <a onclick="NAV.go('reports')"><span>📊</span> My reports</a>
         <a onclick="NAV.go('glossary')"><span>📖</span> Glossary of terms</a>
+        <a onclick="CLOUD.openSetup()"><span>☁️</span> Cloud sync</a>
         <div class="sep"></div>
         <a class="danger" onclick="AUTH.logout()"><span>⎋</span> Log out</a>
       </div>
@@ -1031,6 +1033,22 @@ table.tbl tr{cursor:pointer}
 
 <div id="toasts"></div>
 
+<!-- ============================================================
+     CLOUD BACKEND CONFIG (optional).
+     To enable cross-device sync of accounts & cases, create a free
+     Firebase project, enable Cloud Firestore, and paste your web-app
+     config object below (replace the null). Every device that opens
+     this file will then share the same backend automatically.
+     Leave it as null to keep the app fully local (per-device).
+     ============================================================ -->
+<script>
+window.__ABC_CLOUD__ = { apiKey: "AIzaSyA_jfXi1MLy-cImhcb1duHEornakRtmV_o",
+authDomain: "abcl-los.firebaseapp.com",
+ projectId: "abcl-los",
+appId: "1:998401974542:web:c6558f972607e3abe5f75f",
+ };
+</script>
+
 <script>
 /* ============================================================
    PART A — CONSTANTS, DATA, HELPERS, STATE
@@ -1183,6 +1201,201 @@ const DB = {
   persistent(){ return LS_OK; }
 };
 
+/* ============================================================
+   CLOUD — optional cross-device backend (Firebase Firestore).
+   • Config comes from window.__ABC_CLOUD__ (baked into the file) or
+     from localStorage (set via the in-app "Cloud sync" setup).
+   • When configured & reachable: users, cases and memory are synced
+     to Firestore so any device sees the same accounts & cases.
+   • When absent/offline/error: the app stays fully local (unchanged).
+   All Firestore access is isolated here and guarded by CLOUD.ready.
+   ============================================================ */
+const CLOUD = {
+  ready:false, db:null, status:'off', _lastCases:{}, _cfg:null,
+  cfg(){
+    if(this._cfg!==null) return this._cfg;
+    let c = (typeof window!=='undefined' && window.__ABC_CLOUD__) ? window.__ABC_CLOUD__ : null;
+    if(!c){ try{ const s=localStorage.getItem('los_cloud_cfg'); if(s) c=JSON.parse(s); }catch(e){} }
+    this._cfg = c||false;
+    return this._cfg;
+  },
+  configured(){ const c=this.cfg(); return !!(c && c.projectId && c.apiKey); },
+  saveCfg(obj){ try{ localStorage.setItem('los_cloud_cfg', JSON.stringify(obj)); }catch(e){} this._cfg=obj; },
+  clearCfg(){ try{ localStorage.removeItem('los_cloud_cfg'); }catch(e){} this._cfg=false; this.ready=false; this.status='off'; },
+
+  _loadScript(src){ return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=()=>rej(new Error('load '+src)); document.head.appendChild(s); }); },
+
+  /* Load Firebase (compat) from CDN and connect. Returns true if ready. */
+  async init(){
+    if(this.ready) return true;
+    if(!this.configured()) { this.status='off'; return false; }
+    try{
+      this.status='connecting';
+      if(!(window.firebase && window.firebase.firestore)){
+        const base='https://www.gstatic.com/firebasejs/10.12.0/';
+        await this._loadScript(base+'firebase-app-compat.js');
+        await this._loadScript(base+'firebase-firestore-compat.js');
+      }
+      if(!window.firebase.apps || !window.firebase.apps.length){ window.firebase.initializeApp(this.cfg()); }
+      this.db = window.firebase.firestore();
+      this.ready=true; this.status='connected';
+      return true;
+    }catch(e){ this.ready=false; this.status='error'; console.warn('CLOUD init failed', e); return false; }
+  },
+
+  _col(name){ return this.db.collection(name); },
+
+  /* Pull cloud users + cases, merge with local, push any local-only up. */
+  async pull(){
+    if(!this.ready) return false;
+    try{
+      const [uSnap, cSnap] = await Promise.all([ this._col('los_users').get(), this._col('los_cases').get() ]);
+      const cloudUsers=[]; uSnap.forEach(d=>cloudUsers.push(d.data()));
+      const cloudCases=[]; cSnap.forEach(d=>cloudCases.push(d.data()));
+      /* merge users by email (prefer newer updatedAt) */
+      const uMap={};
+      (STATE.users||[]).forEach(u=>{ uMap[u.email]=u; });
+      cloudUsers.forEach(u=>{ const cur=uMap[u.email]; if(!cur || (u.updatedAt||0)>=(cur.updatedAt||0)) uMap[u.email]=u; });
+      const mergedUsers=Object.values(uMap);
+      /* merge cases by id (prefer newer updatedAt) */
+      const cMap={};
+      (STATE.cases||[]).forEach(c=>{ cMap[c.id]=c; });
+      cloudCases.forEach(c=>{ const cur=cMap[c.id]; if(!cur || (c.updatedAt||0)>=(cur.updatedAt||0)) cMap[c.id]=c; });
+      const mergedCases=Object.values(cMap);
+      STATE.users=mergedUsers; DB.set(K.users, mergedUsers);
+      STATE.cases=mergedCases; DB.set(K.cases, mergedCases);
+      /* snapshot = what cloud currently holds, so syncCases() pushes the local-only diff up */
+      this._lastCases={}; cloudCases.forEach(c=>{ this._lastCases[c.id]=JSON.stringify(cMap[c.id]||c); });
+      /* push everything back so cloud has any local-only records too */
+      await this.pushUsers(true);
+      await this.syncCases(true);
+      /* memory */
+      try{ const mSnap=await this._col('los_meta').doc('memory').get(); if(mSnap.exists){ const m=mSnap.data()&&mSnap.data().data; if(m){ MEM._data=m; DB.set(K.memory,m); } } }catch(e){}
+      return true;
+    }catch(e){ console.warn('CLOUD pull failed', e); this.status='error'; return false; }
+  },
+
+  /* Upsert all users (small set). */
+  async pushUsers(silent){
+    if(!this.ready) return;
+    try{
+      const batch=this.db.batch();
+      (STATE.users||[]).forEach(u=>{ const id=this._docId(u.email); batch.set(this._col('los_users').doc(id), JSON.parse(JSON.stringify(u))); });
+      await batch.commit();
+    }catch(e){ if(!silent) console.warn('pushUsers failed', e); }
+  },
+
+  /* Diff STATE.cases against last snapshot; push changed, delete removed. */
+  async syncCases(silent){
+    if(!this.ready) return;
+    try{
+      const cur={}; (STATE.cases||[]).forEach(c=>cur[c.id]=c);
+      const ops=[]; const batch=this.db.batch(); let n=0;
+      for(const id in cur){
+        const js=JSON.stringify(cur[id]);
+        if(this._lastCases[id]!==js){ batch.set(this._col('los_cases').doc(id), JSON.parse(js)); n++; }
+      }
+      for(const id in this._lastCases){ if(!(id in cur)){ batch.delete(this._col('los_cases').doc(id)); n++; } }
+      if(n){ await batch.commit(); }
+      this._lastCases={}; for(const id in cur) this._lastCases[id]=JSON.stringify(cur[id]);
+    }catch(e){ if(!silent) console.warn('syncCases failed', e); }
+  },
+
+  async pushMemory(){ if(!this.ready) return; try{ await this._col('los_meta').doc('memory').set({data:MEM._data||{}}); }catch(e){} },
+
+  _docId(email){ return String(email||'').replace(/[\/#\[\]\*\.]/g,'_').slice(0,300)||'unknown'; },
+
+  /* called by app whenever cases change (after local persist) */
+  onCasesChanged(){ if(this.ready) this.syncCases(); },
+  onUsersChanged(){ if(this.ready) this.pushUsers(); },
+  onMemoryChanged(){ if(this.ready) this.pushMemory(); },
+
+  statusLabel(){
+    if(this.ready) return '<span style="color:var(--ok);font-weight:600">● Connected & syncing</span>';
+    if(this.status==='connecting') return '<span style="color:var(--gold);font-weight:600">● Connecting…</span>';
+    if(this.status==='error') return '<span style="color:var(--bad);font-weight:600">● Connection error</span>';
+    if(this.configured()) return '<span style="color:var(--gold);font-weight:600">● Configured (not yet connected)</span>';
+    return '<span style="color:var(--ink-3);font-weight:600">○ Off — local only</span>';
+  },
+
+  openSetup(){
+    if(typeof UI==='undefined') return;
+    const cfg=this.cfg()||{};
+    const val=k=>cfg&&cfg[k]?String(cfg[k]).replace(/"/g,'&quot;'):'';
+    const baked = (typeof window!=='undefined' && window.__ABC_CLOUD__) ? true : false;
+    const body=`
+      <div style="font-size:13px;color:var(--ink-2);line-height:1.6">
+        Cross-device sync lets every device that opens this site share the <b>same accounts &amp; cases</b>.
+        It uses a free <b>Firebase Firestore</b> database that you own. Status: ${this.statusLabel()}
+      </div>
+      <div class="banner warn" style="margin:14px 0"><span class="bi">🔒</span><div style="font-size:12.5px">
+        <b>Prototype security note:</b> this stores account records (including a basic password hash) in a database whose read key is public in the page.
+        Use <b>demo / non-sensitive passwords</b> only, and set Firestore rules. This is fine for a college/internship demo, not for real customer data.
+      </div></div>
+      ${baked?`<div class="banner info" style="margin-bottom:12px"><span class="bi">✅</span><div style="font-size:12.5px">A cloud config is <b>baked into this file</b>, so every device already shares it. You can override it on just this device below.</div></div>`:''}
+      <div style="font-size:12.5px;color:var(--ink-3);margin-bottom:10px">Paste the values from your Firebase project (Project settings → Your apps → SDK setup → Config):</div>
+      <div class="field"><label>apiKey</label><input id="cfApiKey" value="${val('apiKey')}" placeholder="AIza…"></div>
+      <div class="field"><label>authDomain</label><input id="cfAuthDomain" value="${val('authDomain')}" placeholder="your-app.firebaseapp.com"></div>
+      <div class="field"><label>projectId</label><input id="cfProjectId" value="${val('projectId')}" placeholder="your-app"></div>
+      <div class="field"><label>appId</label><input id="cfAppId" value="${val('appId')}" placeholder="1:…:web:…"></div>
+      <details style="margin-top:8px"><summary style="cursor:pointer;font-size:12.5px;color:var(--abc-red)">Show step-by-step setup</summary>
+        <ol style="font-size:12px;color:var(--ink-2);line-height:1.7;margin:8px 0 0 4px;padding-left:18px">
+          <li>Go to <b>console.firebase.google.com</b> → Add project (free).</li>
+          <li>Build → <b>Firestore Database</b> → Create → <b>Start in test mode</b> → pick a region.</li>
+          <li>Project settings (gear) → scroll to <b>Your apps</b> → click Web <b>&lt;/&gt;</b> → register app.</li>
+          <li>Copy the four values above from the shown <b>firebaseConfig</b>.</li>
+          <li>Paste here → <b>Connect</b>. Then use “Copy snippet” and paste it into the file for permanent cross-device use, and re-upload.</li>
+        </ol>
+      </details>`;
+    UI.openModal('Cloud sync setup', body,
+      `<button class="btn ghost" onclick="UI.closeModal()">Cancel</button>
+       ${this.configured()?`<button class="btn ghost" onclick="CLOUD.copySnippet()"><span class="ic">📋</span> Copy snippet</button>
+       <button class="btn ghost" onclick="CLOUD.disconnect()">Disconnect</button>`:''}
+       <button class="btn primary" onclick="CLOUD.connect()"><span class="ic">☁️</span> Connect</button>`, true);
+  },
+
+  connect(){
+    const g=id=>{ const el=document.getElementById(id); return el?String(el.value).trim():''; };
+    const obj={ apiKey:g('cfApiKey'), authDomain:g('cfAuthDomain'), projectId:g('cfProjectId'), appId:g('cfAppId') };
+    if(!obj.apiKey||!obj.projectId){ TOAST.show('Missing values','apiKey and projectId are required.','err'); return; }
+    if(!obj.authDomain) obj.authDomain=obj.projectId+'.firebaseapp.com';
+    this.saveCfg(obj);
+    this.ready=false; this.status='connecting';
+    if(typeof UI!=='undefined') UI.closeModal();
+    TOAST.show('Connecting…','Contacting your Firebase project.','info');
+    this.init().then(ok=>{
+      if(!ok){ TOAST.show('Could not connect','Check the values and that Firestore is enabled.','err'); return; }
+      return this.pull().then(()=>{
+        if(typeof refreshChrome==='function') refreshChrome();
+        const cur=(typeof currentViewId==='function')?currentViewId():'dashboard';
+        if(STATE.user && typeof NAV!=='undefined') NAV.go(cur);
+        TOAST.show('Cloud connected','Accounts & cases now sync across devices.','ok');
+      });
+    });
+  },
+
+  disconnect(){
+    this.clearCfg();
+    if(typeof UI!=='undefined') UI.closeModal();
+    TOAST.show('Cloud disconnected','This device is back to local-only storage.','info');
+  },
+
+  copySnippet(){
+    const c=this.cfg(); if(!c){ return; }
+    const snippet='window.__ABC_CLOUD__ = '+JSON.stringify(c)+';';
+    const done=()=>TOAST.show('Snippet copied','Replace the window.__ABC_CLOUD__ line near the top of the HTML with this, then re-upload.','ok');
+    try{ if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(snippet).then(done, ()=>this._fallbackCopy(snippet,done)); } else this._fallbackCopy(snippet,done); }
+    catch(e){ this._fallbackCopy(snippet,done); }
+  },
+  _fallbackCopy(text,done){
+    if(typeof UI!=='undefined') UI.openModal('Copy this snippet',
+      `<div style="font-size:12.5px;color:var(--ink-2);margin-bottom:8px">Replace the <code>window.__ABC_CLOUD__ = null;</code> line near the top of the HTML file with the line below, then re-upload to your host:</div>
+       <textarea readonly style="width:100%;height:120px;font-family:monospace;font-size:11px;padding:10px;border:1px solid var(--line);border-radius:8px" onclick="this.select()">${esc(text)}</textarea>`,
+      `<button class="btn primary" onclick="UI.closeModal()">Done</button>`, true);
+    done&&done();
+  }
+};
+
 /* ---------- global state ---------- */
 const STATE = { user:null, users:[], cases:[], emails:[], openCaseId:null, mailFilter:'all' };
 
@@ -1202,7 +1415,7 @@ function inr(n){ if(n===''||n==null||isNaN(Number(n))) return '—'; return '₹
 function inrCr(rupees){ const c=Number(rupees)/1e7; return isNaN(c)?'—':'₹'+ (c%1===0?c:c.toFixed(2)) +' Cr'; }
 function toCr(rupees){ return (Number(rupees)||0)/1e7; }
 function bytes(n){ if(n==null)return''; if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(0)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
-function persistCases(){ DB.set(K.cases, STATE.cases); }
+function persistCases(){ DB.set(K.cases, STATE.cases); if(typeof CLOUD!=='undefined') CLOUD.onCasesChanged(); }
 function getCase(id){ return STATE.cases.find(c=>c.id===id); }
 
 /* ---------- learning memory (only for analysis‑relevant fields) ---------- */
@@ -1217,7 +1430,7 @@ const MEM = {
     if(!this._data) this.load();
     if(!this._data[bank]) this._data[bank]=[];
     const exists=this._data[bank].some(v=>v.toLowerCase()===value.toLowerCase());
-    if(!exists){ this._data[bank].unshift(value); if(this._data[bank].length>50) this._data[bank].length=50; DB.set(K.memory,this._data); }
+    if(!exists){ this._data[bank].unshift(value); if(this._data[bank].length>50) this._data[bank].length=50; DB.set(K.memory,this._data); if(typeof CLOUD!=='undefined') CLOUD.onMemoryChanged(); }
   }
 };
 
@@ -1274,8 +1487,9 @@ const AUTH = {
     if(p1.length<6) return this.msg('signupMsg','Password must be at least 6 characters.');
     if(p1!==p2) return this.msg('signupMsg','Passwords do not match.');
     if(STATE.users.some(u=>u.email===email)) return this.msg('signupMsg','An account with this email already exists. Try logging in.');
-    const user={ id:uid(), name, email, role, zone, pass:hash(p1), confirmed:true, createdAt:now() };
+    const user={ id:uid(), name, email, role, zone, pass:hash(p1), confirmed:true, createdAt:now(), updatedAt:now() };
     STATE.users.push(user); DB.set(K.users, STATE.users);
+    if(typeof CLOUD!=='undefined') CLOUD.onUsersChanged();
     if(document.getElementById('liRemember')) DB.set(K.remember,{email, pass:hash(p1)});
     TOAST.show('Account created','Welcome, '+name.split(' ')[0]+'!','ok');
     this.startSession(user);
@@ -1305,7 +1519,8 @@ const AUTH = {
     if(!u) return this.msg('resetMsg','No account found for this email. Please sign up first.');
     if(p1.length<6) return this.msg('resetMsg','New password must be at least 6 characters.');
     if(p1!==p2) return this.msg('resetMsg','Passwords do not match.');
-    u.pass=hash(p1); u.confirmed=true; delete u.resetToken; DB.set(K.users,STATE.users);
+    u.pass=hash(p1); u.confirmed=true; u.updatedAt=now(); delete u.resetToken; DB.set(K.users,STATE.users);
+    if(typeof CLOUD!=='undefined') CLOUD.onUsersChanged();
     /* if this email was remembered on this PC, update the stored password too */
     const rem=DB.get(K.remember,null); if(rem&&rem.email===email) DB.set(K.remember,{email,pass:hash(p1)});
     val('rsPass1',''); val('rsPass2','');
@@ -1878,7 +2093,7 @@ const NEWCASE = {
       channel:'', zone:(STATE.user.zone||''), rejectReason:'',
       creditRating:null,cibil:null,
       stageData:{}, stageTimes:{1:{in:now(),out:now()},2:{in:now()}},
-      docs:{}, cc:null, history:[], handoffs:[]
+      docs:{}, cc:null, history:[], handoffs:[], updatedAt:now()
     };
     const col=STAGE_COLLECT[1](c);
     c.stageData[1]={raw:col.raw,display:col.display,by:STATE.user.name,at:now()};
@@ -2087,6 +2302,7 @@ const WF = {
   ccDecide(decision){
     const c=getCase(STATE.openCaseId); if(!c) return;
     ensureCC(c);
+    c.updatedAt=now();
     const cm=c.cc.required[c.cc.current], def=CC_DEFS[cm];
     const proposal=rv(5,'ccProposal'), reason=rv(5,'ccReason');
     if(decision==='Rejected' && !reason){ TOAST.show('Reason required','Please enter a reason for rejection.','err'); return; }
@@ -2122,6 +2338,7 @@ const WF = {
     if(v){ TOAST.show('Cannot proceed',v,'err'); return; }
     const col=STAGE_COLLECT[n](c);
     c.stageData[n]={raw:col.raw,display:col.display,by:STATE.user.name,at:now()};
+    c.updatedAt=now();
 
     /* Stage 7 customer rejection → terminal */
     if(n===7 && col.raw.custDecision==='Rejected'){
@@ -3717,6 +3934,25 @@ function applyLogos(){ ['brandLogo1','brandLogo2','siteLogo','siteLogoFoot'].for
     document.getElementById('authScreen').style.display='grid';
   }
   AUTH.tab('login');
+
+  /* ---- optional cloud bootstrap (cross-device sync) ----
+     Runs after the local-first render so it never blocks startup.
+     Pulls cloud users (so a new device recognises existing accounts even
+     before login) and cases, then refreshes whatever screen is showing. */
+  if(typeof CLOUD!=='undefined' && CLOUD.configured()){
+    CLOUD.init().then(ok=>{
+      if(!ok){ return; }
+      TOAST.show('Cloud connected','Syncing accounts & cases…','info');
+      return CLOUD.pull().then(()=>{
+        /* re-hydrate remember-me email if present */
+        const rem2=DB.get(K.remember,null);
+        if(rem2&&rem2.email){ const li=document.getElementById('liEmail'); if(li&&!li.value)li.value=rem2.email; }
+        /* if the user is already inside the app, refresh their views with merged data */
+        if(STATE.user){ if(typeof APP!=='undefined'&&APP.migrateCases)APP.migrateCases(); if(typeof refreshChrome==='function')refreshChrome(); const cur=(typeof currentViewId==='function')?currentViewId():'dashboard'; if(typeof NAV!=='undefined')NAV.go(cur); }
+        TOAST.show('Cloud synced','Accounts & cases are up to date across devices.','ok');
+      });
+    }).catch(e=>{ console.warn('cloud bootstrap failed', e); });
+  }
 })();
 </script>
 </body>
