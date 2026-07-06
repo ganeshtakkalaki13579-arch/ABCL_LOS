@@ -1248,6 +1248,8 @@ const CLOUD = {
   /* Pull cloud users + cases, merge with local, push any local-only up. */
   async pull(){
     if(!this.ready) return false;
+    if(this._pulling) return this._pulling;      /* dedupe concurrent pulls */
+    this._pulling = (async()=>{
     try{
       const [uSnap, cSnap] = await Promise.all([ this._col('los_users').get(), this._col('los_cases').get() ]);
       const cloudUsers=[]; uSnap.forEach(d=>cloudUsers.push(d.data()));
@@ -1273,6 +1275,9 @@ const CLOUD = {
       try{ const mSnap=await this._col('los_meta').doc('memory').get(); if(mSnap.exists){ const m=mSnap.data()&&mSnap.data().data; if(m){ MEM._data=m; DB.set(K.memory,m); } } }catch(e){}
       return true;
     }catch(e){ console.warn('CLOUD pull failed', e); this.status='error'; return false; }
+    finally{ this._pulling=null; }
+    })();
+    return this._pulling;
   },
 
   /* Upsert all users (small set). */
@@ -1305,10 +1310,26 @@ const CLOUD = {
 
   _docId(email){ return String(email||'').replace(/[\/#\[\]\*\.]/g,'_').slice(0,300)||'unknown'; },
 
-  /* called by app whenever cases change (after local persist) */
-  onCasesChanged(){ if(this.ready) this.syncCases(); },
-  onUsersChanged(){ if(this.ready) this.pushUsers(); },
-  onMemoryChanged(){ if(this.ready) this.pushMemory(); },
+  /* called by app whenever cases change (after local persist).
+     If cloud isn't ready yet (still connecting), mark dirty and flush on connect. */
+  onCasesChanged(){ if(this.ready){ this.syncCases(); } else if(this.configured()){ this._casesDirty=true; this._ensureConnect(); } },
+  onUsersChanged(){ if(this.ready){ this.pushUsers(); } else if(this.configured()){ this._usersDirty=true; this._ensureConnect(); } },
+  onMemoryChanged(){ if(this.ready){ this.pushMemory(); } else if(this.configured()){ this._memDirty=true; this._ensureConnect(); } },
+
+  /* connect in the background (once) and flush any pending changes */
+  _ensureConnect(){
+    if(this.ready || this._connecting) return;
+    this._connecting=true;
+    this.init().then(okc=>{ this._connecting=false; if(okc) return this._flush(); }).catch(()=>{ this._connecting=false; });
+  },
+  _flush(){
+    /* pull first so we merge before pushing, then push pending changes */
+    return this.pull().then(()=>{
+      if(this._usersDirty){ this._usersDirty=false; this.pushUsers(true); }
+      if(this._casesDirty){ this._casesDirty=false; this.syncCases(true); }
+      if(this._memDirty){ this._memDirty=false; this.pushMemory(); }
+    });
+  },
 
   statusLabel(){
     if(this.ready) return '<span style="color:var(--ok);font-weight:600">● Connected & syncing</span>';
@@ -3859,7 +3880,7 @@ const DOCX = {
    ============================================================ */
 const APP = {
   boot(){
-    /* hydrate */
+    /* hydrate from local first (fast, offline-safe) */
     STATE.cases=DB.get(K.cases,[]); STATE.emails=DB.get(K.emails,[]);
     APP.migrateCases();
     /* header */
@@ -3873,6 +3894,18 @@ const APP = {
     if(!DB.persistent() && !APP._warnedStorage){
       APP._warnedStorage=true;
       TOAST.show('Session‑only mode','This preview can’t use browser storage, so cases won’t be saved after you close the tab. Download the file (or open the hosted page) for permanent saving.','info');
+    }
+    /* CLOUD: after the local-first render, connect (if configured) and pull the
+       shared accounts + cases so this device shows the same data as every other. */
+    if(typeof CLOUD!=='undefined' && CLOUD.configured()){
+      const finish=()=>{
+        if(typeof refreshChrome==='function') refreshChrome();
+        const cur=(typeof currentViewId==='function')?currentViewId():'dashboard';
+        if(typeof NAV!=='undefined') NAV.go(cur);
+      };
+      const doPull=()=> CLOUD.pull().then(()=>{ APP.migrateCases(); finish(); TOAST.show('Cloud synced', STATE.cases.length+' case(s) loaded from your account.','ok'); });
+      if(CLOUD.ready){ doPull(); }
+      else { TOAST.show('Cloud connecting','Loading your cases from the cloud…','info'); CLOUD.init().then(okc=>{ if(okc) return doPull(); }).catch(e=>console.warn('cloud boot pull failed',e)); }
     }
   },
 
@@ -3936,20 +3969,17 @@ function applyLogos(){ ['brandLogo1','brandLogo2','siteLogo','siteLogoFoot'].for
   AUTH.tab('login');
 
   /* ---- optional cloud bootstrap (cross-device sync) ----
-     Runs after the local-first render so it never blocks startup.
-     Pulls cloud users (so a new device recognises existing accounts even
-     before login) and cases, then refreshes whatever screen is showing. */
-  if(typeof CLOUD!=='undefined' && CLOUD.configured()){
+     Runs after the local-first render. When a session is already active,
+     APP.boot() performs the cloud pull, so here we only handle the
+     logged-out case: connect + pull users so a new device recognises
+     existing accounts before login. */
+  if(typeof CLOUD!=='undefined' && CLOUD.configured() && !STATE.user){
     CLOUD.init().then(ok=>{
       if(!ok){ return; }
-      TOAST.show('Cloud connected','Syncing accounts & cases…','info');
       return CLOUD.pull().then(()=>{
         /* re-hydrate remember-me email if present */
         const rem2=DB.get(K.remember,null);
         if(rem2&&rem2.email){ const li=document.getElementById('liEmail'); if(li&&!li.value)li.value=rem2.email; }
-        /* if the user is already inside the app, refresh their views with merged data */
-        if(STATE.user){ if(typeof APP!=='undefined'&&APP.migrateCases)APP.migrateCases(); if(typeof refreshChrome==='function')refreshChrome(); const cur=(typeof currentViewId==='function')?currentViewId():'dashboard'; if(typeof NAV!=='undefined')NAV.go(cur); }
-        TOAST.show('Cloud synced','Accounts & cases are up to date across devices.','ok');
       });
     }).catch(e=>{ console.warn('cloud bootstrap failed', e); });
   }
