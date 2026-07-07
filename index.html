@@ -1042,11 +1042,7 @@ table.tbl tr{cursor:pointer}
      Leave it as null to keep the app fully local (per-device).
      ============================================================ -->
 <script>
-window.__ABC_CLOUD__ = { apiKey: "AIzaSyA_jfXi1MLy-cImhcb1duHEornakRtmV_o",
-authDomain: "abcl-los.firebaseapp.com",
- projectId: "abcl-los",
-appId: "1:998401974542:web:c6558f972607e3abe5f75f",
- };
+window.__ABC_CLOUD__ = {"apiKey":"AIzaSyA-G3MZoQqJW4IzaBh2mBzN16-EeuuIaPA","authDomain":"abclnbfc-los.firebaseapp.com","projectId":"abclnbfc-los","appId":"1:580126083361:web:8799dc50b589dd54995660"};
 </script>
 
 <script>
@@ -1265,7 +1261,7 @@ const CLOUD = {
       cloudCases.forEach(c=>{ const cur=cMap[c.id]; if(!cur || (c.updatedAt||0)>=(cur.updatedAt||0)) cMap[c.id]=c; });
       const mergedCases=Object.values(cMap);
       STATE.users=mergedUsers; DB.set(K.users, mergedUsers);
-      STATE.cases=mergedCases; DB.set(K.cases, mergedCases);
+      STATE.cases=mergedCases; normalizeAllCases(); DB.set(K.cases, STATE.cases);
       /* snapshot = what cloud currently holds, so syncCases() pushes the local-only diff up */
       this._lastCases={}; cloudCases.forEach(c=>{ this._lastCases[c.id]=JSON.stringify(cMap[c.id]||c); });
       /* push everything back so cloud has any local-only records too */
@@ -1436,6 +1432,37 @@ function inr(n){ if(n===''||n==null||isNaN(Number(n))) return '—'; return '₹
 function inrCr(rupees){ const c=Number(rupees)/1e7; return isNaN(c)?'—':'₹'+ (c%1===0?c:c.toFixed(2)) +' Cr'; }
 function toCr(rupees){ return (Number(rupees)||0)/1e7; }
 function bytes(n){ if(n==null)return''; if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(0)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+
+/* Guarantee a case object has all the fields the app reads, so a single
+   malformed record (e.g. from an interrupted save, an import, or cloud merge)
+   can never crash the dashboards/analysis/reports. Returns the (repaired) case. */
+function normalizeCase(c){
+  if(!c || typeof c!=='object') return null;
+  if(c.id==null) c.id = uid();
+  if(c.caseId==null) c.caseId = 'LOS-'+String(c.id).slice(-6);
+  if(typeof c.createdAt!=='number') c.createdAt = Number(c.createdAt)||now();
+  if(!c.createdBy || typeof c.createdBy!=='object') c.createdBy = {};
+  if(c.createdBy.name==null) c.createdBy.name = 'Unknown';
+  if(c.createdBy.email==null) c.createdBy.email = '';
+  if(c.createdBy.role==null) c.createdBy.role = 'RM';
+  if(c.status==null) c.status = 'active';
+  if(typeof c.currentStage!=='number') c.currentStage = Number(c.currentStage)||2;
+  if(!c.stageData || typeof c.stageData!=='object') c.stageData = {};
+  if(!c.stageTimes || typeof c.stageTimes!=='object') c.stageTimes = {};
+  if(!c.docs || typeof c.docs!=='object') c.docs = {};
+  if(!Array.isArray(c.history)) c.history = [];
+  if(!Array.isArray(c.handoffs)) c.handoffs = [];
+  if(c.clientName==null) c.clientName = '';
+  if(c.clientType==null) c.clientType = '';
+  if(c.businessName==null) c.businessName = '';
+  if(c.amount==null) c.amount = '';
+  if(c.amountCr==null) c.amountCr = toCr(c.amount);
+  if(c.zone==null) c.zone = (c.createdBy&&c.createdBy.zone)||'';
+  if(c.channel==null) c.channel = '';
+  return c;
+}
+function normalizeAllCases(){ if(!Array.isArray(STATE.cases)) { STATE.cases=[]; return; } STATE.cases = STATE.cases.map(normalizeCase).filter(Boolean); }
+
 function persistCases(){ DB.set(K.cases, STATE.cases); if(typeof CLOUD!=='undefined') CLOUD.onCasesChanged(); }
 function getCase(id){ return STATE.cases.find(c=>c.id===id); }
 
@@ -1640,10 +1667,11 @@ const NAV = {
     const m=VIEW_META[view]||[view,''];
     document.getElementById('topCrumb').innerHTML=`${m[0]} <small>${m[1]}</small>`;
     document.getElementById('sidebar').classList.remove('open');
-    if(view==='dashboard') DASH.render();
-    if(view==='reports') REPORTS.render();
-    if(view==='analysis') ANALYSIS.render();
-    if(view==='pipeline') PIPE.render();
+    const safe=(name,fn)=>{ try{ fn(); }catch(e){ console.warn(name+' render failed', e); TOAST.show('Display issue','Some data could not be shown; the rest of the app still works.','err'); } };
+    if(view==='dashboard') safe('dashboard',()=>DASH.render());
+    if(view==='reports') safe('reports',()=>REPORTS.render());
+    if(view==='analysis') safe('analysis',()=>ANALYSIS.render());
+    if(view==='pipeline') safe('pipeline',()=>PIPE.render());
     if(view==='newcase') NEWCASE.render();
     if(view==='data') DATA.render();
     if(view==='email') MAIL.render();
@@ -2412,14 +2440,16 @@ const WF = {
 
 /* per-case computed helpers */
 function caseStageLabel(c){
+  if(!c) return '—';
   if(c.status==='completed') return 'Completed';
   if(c.status==='rejected') return 'Rejected';
-  const s=STAGE_BY_N(Math.min(c.currentStage,TOTAL_STAGES));
+  const s=STAGE_BY_N(Math.min(Number(c.currentStage)||2,TOTAL_STAGES));
   return s?('Stage '+s.n+' · '+s.name):'—';
 }
 function caseTotalTAT(c){
+  if(!c||!c.stageTimes||typeof c.stageTimes!=='object') return null;
   let total=0,hasOut=false;
-  for(const k in c.stageTimes){ const t=c.stageTimes[k]; if(t.in&&t.out){ total+=(t.out-t.in); hasOut=true; } }
+  for(const k in c.stageTimes){ const t=c.stageTimes[k]; if(t&&t.in&&t.out){ total+=(t.out-t.in); hasOut=true; } }
   /* add current in-progress stage up to now */
   const cur=c.stageTimes[c.currentStage];
   if(cur&&cur.in&&!cur.out&&c.status!=='completed'&&c.status!=='rejected'){ total+=(now()-cur.in); hasOut=true; }
@@ -2437,7 +2467,7 @@ function statusChipHTML(c){
    Used by Dashboard (all cases), Reports (filtered set) and the PPT deck. */
 const DASHVIZ = {
   stats(cs){
-    const money=(c,k)=>{ const raw=c.stageData[k]&&c.stageData[k].raw; const v=(raw&&raw[k===6?'sanctionedAmt':'disbAmt'])||(k===6?c.sanctionedAmt:c.disbursedAmt); return Number(v)||0; };
+    const money=(c,k)=>{ const sd=c.stageData||{}; const raw=sd[k]&&sd[k].raw; const v=(raw&&raw[k===6?'sanctionedAmt':'disbAmt'])||(k===6?c.sanctionedAmt:c.disbursedAmt); return Number(v)||0; };
     const total=cs.length;
     const active=cs.filter(c=>c.status==='active'||c.status==='approved').length;
     const disbursed=cs.filter(c=>c.status==='disbursed'||c.status==='completed').length;
@@ -2587,6 +2617,7 @@ const DRILL = {
 const DASH = {
   render(){
     if(!STATE.user) return;
+    normalizeAllCases();
     const cs=STATE.cases;
     const active=cs.filter(c=>c.status==='active'||c.status==='approved').length;
     const completed=cs.filter(c=>c.status==='completed').length;
@@ -2642,6 +2673,7 @@ const DASH = {
 /* ---------------- REPORTS ---------------- */
 const REPORTS = {
   render(){
+    normalizeAllCases();
     /* populate filter dropdowns once */
     const stageSel=document.getElementById('fltStage');
     if(stageSel.options.length<=1){ STAGES.forEach(s=>stageSel.add(new Option('Stage '+s.n+' · '+s.name,s.n))); stageSel.add(new Option('Completed','done')); }
@@ -2703,6 +2735,7 @@ const REPORTS = {
 /* ---------------- PIPELINE ---------------- */
 const PIPE = {
   render(){
+    normalizeAllCases();
     /* visual dashboard for the active pipeline */
     const activeCs = STATE.cases.filter(c=>['active','approved','disbursed'].includes(c.status));
     const pc=document.getElementById('pipeCharts');
@@ -2772,9 +2805,9 @@ const CHANNEL_GROUP = ch => {
   if(/Channel Partner/i.test(ch)) return 'Channel Partner';
   return ch||'Unknown';
 };
-const caseChannel = c => c.channel || (c.stageData[1]&&c.stageData[1].raw&&c.stageData[1].raw.channel) || 'Unknown';
-const caseZone = c => c.zone || (c.stageData[1]&&c.stageData[1].raw&&c.stageData[1].raw.zone) || (c.createdBy&&c.createdBy.zone) || 'Unassigned';
-const isDisbursed = c => c.status==='disbursed' || c.status==='completed' || (c.stageData[9]&&c.stageData[9].raw&&c.stageData[9].raw.disbStatus==='Disbursed');
+const caseChannel = c => (c&&c.channel) || (c&&c.stageData&&c.stageData[1]&&c.stageData[1].raw&&c.stageData[1].raw.channel) || 'Unknown';
+const caseZone = c => (c&&c.zone) || (c&&c.stageData&&c.stageData[1]&&c.stageData[1].raw&&c.stageData[1].raw.zone) || (c&&c.createdBy&&c.createdBy.zone) || 'Unassigned';
+const isDisbursed = c => c&&(c.status==='disbursed' || c.status==='completed' || (c.stageData&&c.stageData[9]&&c.stageData[9].raw&&c.stageData[9].raw.disbStatus==='Disbursed'));
 
 const PIE_COLORS = ['#BE1E2D','#F26522','#F8981D','#FBB315','#1f9d57','#1769aa','#7b39c9','#C77700','#8a767b','#28c840'];
 
@@ -2843,6 +2876,7 @@ function barCard(title, sub, rows, opt={}){
 
 const ANALYSIS = {
   render(){
+    normalizeAllCases();
     const zoneF=document.getElementById('anZone').value;
     let cs=STATE.cases.slice();
     if(zoneF) cs=cs.filter(c=>caseZone(c)===zoneF);
@@ -3912,6 +3946,7 @@ const APP = {
   /* Repair cases created by older builds so amounts always display.
      Back-fills top-level fields from stage data (and vice-versa) without overwriting good values. */
   migrateCases(){
+    normalizeAllCases();
     let changed=false;
     (STATE.cases||[]).forEach(c=>{
       const sd=c.stageData||{};
